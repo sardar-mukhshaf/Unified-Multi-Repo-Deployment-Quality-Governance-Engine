@@ -1,0 +1,104 @@
+# ------------------------------------------------------------------------------
+# ArgoCD Helm Values — Banking-Grade GitOps Configuration
+# ------------------------------------------------------------------------------
+
+global:
+  image:
+    tag: v2.9.3
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+dex:
+  enabled: false
+
+redis:
+  enabled: true
+  securityContext:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+
+server:
+  replicas: 2
+  extraArgs:
+    - --insecure=false
+  ingress:
+    enabled: false
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 75
+  securityContext:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+  config:
+    url: https://argocd.unified-saas.example.com
+    admin.enabled: "false"
+    oidc.config: |
+      name: Keycloak
+      issuer: https://keycloak.unified-saas.example.com/realms/production
+      clientID: argocd-client
+      clientSecret: $oidc.keycloak.clientSecret
+      requestedScopes: ["openid", "profile", "email", "groups"]
+      requestedIDTokenClaims: {"groups": {"essential": true}}
+  rbacConfig:
+    policy.default: role:readonly
+    policy.csv: |
+      p, role:org-admin, applications, *, */*, allow
+      p, role:org-admin, clusters, get, *, allow
+      p, role:org-admin, repositories, *, *, allow
+      g, argocd-admins, role:org-admin
+
+repoServer:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+  securityContext:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+
+applicationSet:
+  replicas: 2
+  securityContext:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+  securityContext:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+
+configs:
+  secret:
+    argocdServerAdminPassword: "$2a$10$..."  # bcrypt hash of admin password (injected via Vault/SealedSecret)
+    argocdServerAdminPasswordMtime: "2024-01-01T00:00:00Z"
+
+notifications:
+  enabled: true

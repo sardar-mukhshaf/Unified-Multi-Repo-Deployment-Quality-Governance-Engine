@@ -1,0 +1,73 @@
+# ------------------------------------------------------------------------------
+# NetworkPolicy — Frontend UI
+# Zero-trust: Explicit whitelist for ingress and egress
+# Frontend only serves static assets; all API calls proxied to backend-api
+# ------------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-ui-netpol
+  namespace: default
+  labels:
+    app: frontend-ui
+    app.kubernetes.io/name: frontend-ui-netpol
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend-ui
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic only from Istio Ingress Gateway
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: istio-system
+          podSelector:
+            matchLabels:
+              app: istio-ingressgateway
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Allow Prometheus scraping from monitoring namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow connection to backend-api (for SSR or health-check proxies)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: backend-api
+      ports:
+        - protocol: TCP
+          port: 3000
+    # Allow OTLP telemetry export
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+          podSelector:
+            matchLabels:
+              app: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317

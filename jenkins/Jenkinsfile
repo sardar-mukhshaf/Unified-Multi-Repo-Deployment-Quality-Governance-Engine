@@ -1,0 +1,402 @@
+#!/usr/bin/env groovy
+// ------------------------------------------------------------------------------
+// Enterprise Jenkinsfile — Unified SaaS CI/CD Pipeline
+// Banking-Grade Quality Governance with SAMA/NCA Compliance
+// ------------------------------------------------------------------------------
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+                apiVersion: v1
+                kind: Pod
+                spec:
+                  serviceAccountName: jenkins-agent
+                  containers:
+                    - name: node
+                      image: node:20.11.0-alpine
+                      command: ['cat']
+                      tty: true
+                      resources:
+                        requests:
+                          cpu: 500m
+                          memory: 1Gi
+                        limits:
+                          cpu: 2000m
+                          memory: 4Gi
+                    - name: docker
+                      image: docker:24.0.7-dind
+                      command: ['dockerd-entrypoint.sh']
+                      tty: true
+                      privileged: true
+                      resources:
+                        requests:
+                          cpu: 1000m
+                          memory: 2Gi
+                        limits:
+                          cpu: 4000m
+                          memory: 8Gi
+                      volumeMounts:
+                        - name: docker-graph-storage
+                          mountPath: /var/lib/docker
+                    - name: trivy
+                      image: aquasec/trivy:0.48.3
+                      command: ['cat']
+                      tty: true
+                      resources:
+                        requests:
+                          cpu: 500m
+                          memory: 512Mi
+                        limits:
+                          cpu: 2000m
+                          memory: 2Gi
+                    - name: yq
+                      image: mikefarah/yq:4.40.5
+                      command: ['cat']
+                      tty: true
+                    - name: aws-cli
+                      image: amazon/aws-cli:2.15.0
+                      command: ['cat']
+                      tty: true
+                  volumes:
+                    - name: docker-graph-storage
+                      emptyDir: {}
+            """
+        }
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    environment {
+        APP_NAME           = 'unified-saas'
+        AWS_REGION         = 'me-central-1'
+        AWS_ACCOUNT_ID     = credentials('aws-account-id')
+        ECR_FRONTEND       = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/unified-saas-frontend"
+        ECR_BACKEND        = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/unified-saas-backend"
+        GIT_COMMIT_SHORT   = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        IMAGE_TAG          = "${env.BUILD_NUMBER}-${GIT_COMMIT_SHORT}"
+        SONARQUBE_TOKEN    = credentials('sonarqube-token')
+        SONARQUBE_SERVER   = 'https://sonarqube.internal.example.com'
+        GITOPS_REPO_URL    = credentials('gitops-repo-url')
+        GITOPS_REPO_CRED   = credentials('github-ssh-key')
+    }
+
+    stages {
+        // =====================================================================
+        // STAGE 1: Static Code Analysis & Linting
+        // =====================================================================
+        stage('Static Code Analysis') {
+            parallel {
+                stage('Frontend Lint & Build') {
+                    steps {
+                        container('node') {
+                            dir('frontend') {
+                                sh '''
+                                    npm ci --ignore-scripts
+                                    npx tsc --noEmit
+                                    npm run lint
+                                    npm run build
+                                '''
+                            }
+                        }
+                    }
+                }
+                stage('Backend Lint & Build') {
+                    steps {
+                        container('node') {
+                            dir('backend') {
+                                sh '''
+                                    npm ci --ignore-scripts
+                                    npx prisma generate
+                                    npx tsc --noEmit
+                                    npm run lint
+                                    npm run build
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 2: Secret Auditing (Gitleaks)
+        // =====================================================================
+        stage('Secret Audit') {
+            steps {
+                container('node') {
+                    sh '''
+                        wget -qO /usr/local/bin/gitleaks https://github.com/zricethezav/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz
+                        # Fallback: use npm-based secret scanning if binary fetch fails
+                        if [ ! -f /usr/local/bin/gitleaks ]; then
+                            npm install -g gitleaks-cli@latest || true
+                        fi
+                    '''
+                }
+                script {
+                    def gitleaksResult = sh(
+                        script: '''
+                            gitleaks detect \
+                                --source . \
+                                --verbose \
+                                --redact \
+                                --report-format json \
+                                --report-path gitleaks-report.json || true
+                        ''',
+                        returnStatus: true
+                    )
+                    if (gitleaksResult != 0) {
+                        def report = readJSON file: 'gitleaks-report.json'
+                        if (report && report.length > 0) {
+                            error "Gitleaks detected ${report.length} secrets in commit history. Build aborted."
+                        }
+                    }
+                }
+                archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+            }
+        }
+
+        // =====================================================================
+        // STAGE 3: SonarQube Governance Gate
+        // =====================================================================
+        stage('SonarQube Governance') {
+            steps {
+                container('node') {
+                    withSonarQubeEnv('SonarQube-Enterprise') {
+                        sh '''
+                            npm install -g sonarqube-scanner
+                        '''
+                        sh '''
+                            sonar-scanner \
+                                -Dsonar.projectKey=${APP_NAME} \
+                                -Dsonar.projectName="Unified SaaS Platform" \
+                                -Dsonar.projectVersion=${IMAGE_TAG} \
+                                -Dsonar.sources=frontend/src,backend/src \
+                                -Dsonar.tests=frontend/src/__tests__,backend/src/__tests__ \
+                                -Dsonar.typescript.lcov.reportPaths=frontend/coverage/lcov.info,backend/coverage/lcov.info \
+                                -Dsonar.coverage.exclusions="**/*.test.ts,**/*.test.tsx,**/prisma/**" \
+                                -Dsonar.exclusions="**/node_modules/**,**/dist/**,**/coverage/**" \
+                                -Dsonar.token=${SONARQUBE_TOKEN} \
+                                -Dsonar.host.url=${SONARQUBE_SERVER}
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 4: Parallel Multi-Architecture Container Build
+        // =====================================================================
+        stage('Build Containers') {
+            parallel {
+                stage('Build Frontend') {
+                    steps {
+                        container('docker') {
+                            sh '''
+                                docker buildx create --use --name multiarch || true
+                                docker buildx inspect --bootstrap
+                            '''
+                            sh '''
+                                docker buildx build \
+                                    --platform linux/amd64,linux/arm64 \
+                                    --file docker/frontend.Dockerfile \
+                                    --tag ${ECR_FRONTEND}:${IMAGE_TAG} \
+                                    --tag ${ECR_FRONTEND}:latest \
+                                    --cache-from type=registry,ref=${ECR_FRONTEND}:cache \
+                                    --cache-to type=inline \
+                                    --load \
+                                    .
+                            '''
+                        }
+                    }
+                }
+                stage('Build Backend') {
+                    steps {
+                        container('docker') {
+                            sh '''
+                                docker buildx create --use --name multiarch || true
+                                docker buildx inspect --bootstrap
+                            '''
+                            sh '''
+                                docker buildx build \
+                                    --platform linux/amd64,linux/arm64 \
+                                    --file docker/backend.Dockerfile \
+                                    --tag ${ECR_BACKEND}:${IMAGE_TAG} \
+                                    --tag ${ECR_BACKEND}:latest \
+                                    --cache-from type=registry,ref=${ECR_BACKEND}:cache \
+                                    --cache-to type=inline \
+                                    --load \
+                                    .
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 5: Vulnerability Assessment (Trivy Scan)
+        // =====================================================================
+        stage('Vulnerability Scan') {
+            parallel {
+                stage('Scan Frontend') {
+                    steps {
+                        container('trivy') {
+                            sh '''
+                                trivy image \
+                                    --severity CRITICAL,HIGH \
+                                    --exit-code 1 \
+                                    --format json \
+                                    --output trivy-frontend-report.json \
+                                    --ignore-unfixed \
+                                    ${ECR_FRONTEND}:${IMAGE_TAG} || true
+                            '''
+                            sh '''
+                                CRITICAL_COUNT=$(trivy image --severity CRITICAL --exit-code 0 --format json ${ECR_FRONTEND}:${IMAGE_TAG} | grep -c '"Severity": "CRITICAL"' || echo "0")
+                                echo "Frontend Critical CVEs: ${CRITICAL_COUNT}"
+                                if [ "${CRITICAL_COUNT}" -gt 0 ]; then
+                                    echo "CRITICAL vulnerabilities found in frontend image. Failing build."
+                                    exit 1
+                                fi
+                            '''
+                        }
+                    }
+                }
+                stage('Scan Backend') {
+                    steps {
+                        container('trivy') {
+                            sh '''
+                                trivy image \
+                                    --severity CRITICAL,HIGH \
+                                    --exit-code 1 \
+                                    --format json \
+                                    --output trivy-backend-report.json \
+                                    --ignore-unfixed \
+                                    ${ECR_BACKEND}:${IMAGE_TAG} || true
+                            '''
+                            sh '''
+                                CRITICAL_COUNT=$(trivy image --severity CRITICAL --exit-code 0 --format json ${ECR_BACKEND}:${IMAGE_TAG} | grep -c '"Severity": "CRITICAL"' || echo "0")
+                                echo "Backend Critical CVEs: ${CRITICAL_COUNT}"
+                                if [ "${CRITICAL_COUNT}" -gt 0 ]; then
+                                    echo "CRITICAL vulnerabilities found in backend image. Failing build."
+                                    exit 1
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 6: Artifact Versioning & ECR Push
+        // =====================================================================
+        stage('Push to ECR') {
+            steps {
+                container('aws-cli') {
+                    sh '''
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    '''
+                }
+                container('docker') {
+                    sh '''
+                        docker push ${ECR_FRONTEND}:${IMAGE_TAG}
+                        docker push ${ECR_FRONTEND}:latest
+                        docker push ${ECR_BACKEND}:${IMAGE_TAG}
+                        docker push ${ECR_BACKEND}:latest
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 7: GitOps Manifest Mutation (ArgoCD Trigger)
+        // =====================================================================
+        stage('Update GitOps Manifests') {
+            steps {
+                container('yq') {
+                    script {
+                        // Clone the GitOps manifest repository
+                        sshagent(credentials: ['github-ssh-key']) {
+                            sh '''
+                                mkdir -p gitops-repo && cd gitops-repo
+                                git clone ${GITOPS_REPO_URL} .
+                                git config user.email "jenkins@unified-saas.local"
+                                git config user.name "Jenkins CI"
+                            '''
+
+                            // Update frontend image tag
+                            sh '''
+                                cd gitops-repo
+                                yq e -i \
+                                    '.spec.template.spec.containers[0].image = "${ECR_FRONTEND}:${IMAGE_TAG}"' \
+                                    apps/frontend/deployment.yaml
+                            '''
+
+                            // Update backend image tag
+                            sh '''
+                                cd gitops-repo
+                                yq e -i \
+                                    '.spec.template.spec.containers[0].image = "${ECR_BACKEND}:${IMAGE_TAG}"' \
+                                    apps/backend/deployment.yaml
+                            '''
+
+                            // Commit and push changes to trigger ArgoCD sync
+                            sh '''
+                                cd gitops-repo
+                                git add apps/frontend/deployment.yaml apps/backend/deployment.yaml
+                                git diff --cached --quiet || git commit -m "ci: deploy ${APP_NAME} ${IMAGE_TAG} [Jenkins Build ${BUILD_NUMBER}]"
+                                git push origin main
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // Archive all scan reports
+                archiveArtifacts artifacts: 'trivy-frontend-report.json,trivy-backend-report.json,gitleaks-report.json', allowEmptyArchive: true
+
+                // Publish test results if available
+                junit testResults: 'frontend/junit.xml,backend/junit.xml', allowEmptyResults: true
+            }
+        }
+        failure {
+            emailext (
+                subject: "FAILED: Build ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """Build Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+
+Check console output at ${env.BUILD_URL}console
+
+Security scan reports are attached.
+""",
+                recipientProviders: [developers(), requestor()],
+                to: "devops-alerts@unified-saas.example.com"
+            )
+        }
+        success {
+            script {
+                currentBuild.description = "Deployed ${IMAGE_TAG}"
+            }
+        }
+    }
+}

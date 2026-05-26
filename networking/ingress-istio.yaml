@@ -1,0 +1,252 @@
+# ------------------------------------------------------------------------------
+# Istio Ingress Gateway + VirtualService + DestinationRule
+# Path-based routing, mTLS STRICT, 10% Canary split
+# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# Istio Gateway — External Traffic Entry Point
+# ==============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: unified-saas-gateway
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/name: unified-saas-gateway
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: unified-saas-tls-cert
+        minProtocolVersion: TLSV1_3
+        cipherSuites:
+          - TLS_AES_256_GCM_SHA384
+          - TLS_CHACHA20_POLY1305_SHA256
+      hosts:
+        - "app.unified-saas.example.com"
+        - "api.unified-saas.example.com"
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "app.unified-saas.example.com"
+        - "api.unified-saas.example.com"
+      # Redirect HTTP to HTTPS for compliance
+      tls:
+        httpsRedirect: true
+
+---
+# ==============================================================================
+# VirtualService — Path-Based Traffic Routing
+# ==============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: unified-saas-routing
+  namespace: default
+  labels:
+    app.kubernetes.io/name: unified-saas-routing
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  hosts:
+    - "app.unified-saas.example.com"
+    - "api.unified-saas.example.com"
+  gateways:
+    - istio-system/unified-saas-gateway
+  http:
+    # Route /api traffic to backend service
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: backend-api
+            port:
+              number: 3000
+          weight: 90
+        - destination:
+            host: backend-api-canary
+            port:
+              number: 3000
+          weight: 10
+      # Request timeout to prevent cascading failures
+      timeout: 30s
+      retries:
+        attempts: 3
+        perTryTimeout: 10s
+        retryOn: gateway-error,connect-failure,refused-stream
+      # CORS for API endpoints
+      corsPolicy:
+        allowOrigins:
+          - exact: "https://app.unified-saas.example.com"
+        allowMethods: [GET, POST, PUT, DELETE, PATCH, OPTIONS]
+        allowHeaders: [Authorization, Content-Type, X-Tenant-ID, X-Request-ID]
+        allowCredentials: true
+        maxAge: "24h"
+
+    # Route all other traffic to frontend
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: frontend-ui
+            port:
+              number: 8080
+          weight: 90
+        - destination:
+            host: frontend-ui-canary
+            port:
+              number: 8080
+          weight: 10
+      timeout: 30s
+
+---
+# ==============================================================================
+# DestinationRule — Backend mTLS STRICT + Circuit Breaker
+# ==============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: backend-api-mtls
+  namespace: default
+  labels:
+    app.kubernetes.io/name: backend-api-mtls
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  host: backend-api
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 100
+        maxRequestsPerConnection: 10
+        maxRetries: 3
+    loadBalancer:
+      simple: LEAST_CONN
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+    - name: stable
+      labels:
+        version: stable
+    - name: canary
+      labels:
+        version: canary
+
+---
+# ==============================================================================
+# DestinationRule — Frontend mTLS STRICT
+# ==============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: frontend-ui-mtls
+  namespace: default
+  labels:
+    app.kubernetes.io/name: frontend-ui-mtls
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  host: frontend-ui
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    loadBalancer:
+      simple: ROUND_ROBIN
+  subsets:
+    - name: stable
+      labels:
+        version: stable
+    - name: canary
+      labels:
+        version: canary
+
+---
+# ==============================================================================
+# PeerAuthentication — Enforce mTLS STRICT across the namespace
+# ==============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: default
+  labels:
+    app.kubernetes.io/name: default-mtls
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  mtls:
+    mode: STRICT
+
+---
+# ==============================================================================
+# AuthorizationPolicy — Deny all traffic by default, whitelist explicitly
+# ==============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: default-deny-all
+  namespace: default
+  labels:
+    app.kubernetes.io/name: default-deny-all
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  {}
+
+---
+# ==============================================================================
+# AuthorizationPolicy — Allow ingress gateway to reach services
+# ==============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingress-gateway
+  namespace: default
+  labels:
+    app.kubernetes.io/name: allow-ingress-gateway
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: unified-saas
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"]
+
+---
+# ==============================================================================
+# AuthorizationPolicy — Allow backend to reach database (PgBouncer)
+# ==============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-backend-to-database
+  namespace: default
+  labels:
+    app.kubernetes.io/name: allow-backend-to-database
+    app.kubernetes.io/part-of: unified-saas
+spec:
+  selector:
+    matchLabels:
+      app: backend-api
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            methods: ["POST", "GET"]
+            ports: ["5432", "6432"]

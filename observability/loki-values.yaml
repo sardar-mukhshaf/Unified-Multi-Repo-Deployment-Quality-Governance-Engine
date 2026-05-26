@@ -1,0 +1,302 @@
+# ------------------------------------------------------------------------------
+# Loki Stack Helm Values — Production
+# Deploys: Loki (log aggregation) + Promtail (log shipper)
+# Namespace: monitoring
+# Integrates with Grafana datasource in prometheus-values.yaml
+# ------------------------------------------------------------------------------
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loki
+# ─────────────────────────────────────────────────────────────────────────────
+loki:
+  enabled: true
+
+  commonLabels:
+    app.kubernetes.io/part-of: unified-saas
+    compliance: SAMA-NCA
+
+  # Use SimpleScalable mode for production HA
+  # Separates read and write paths for independent scaling
+  deploymentMode: SimpleScalable
+
+  loki:
+    auth_enabled: false
+
+    commonConfig:
+      replication_factor: 3
+
+    storage:
+      type: s3
+      s3:
+        region: me-central-1
+        bucketNames:
+          chunks: unified-saas-loki-chunks-prod
+          ruler: unified-saas-loki-ruler-prod
+          admin: unified-saas-loki-admin-prod
+        # Use IRSA — no static credentials required
+        s3ForcePathStyle: false
+        insecure: false
+
+    schemaConfig:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: s3
+          schema: v13
+          index:
+            prefix: loki_index_
+            period: 24h
+
+    limits_config:
+      # Retention enforced at ingestion (SAMA requires 1-year minimum for financial logs)
+      retention_period: 8760h   # 365 days
+      # Per-stream ingestion limits
+      ingestion_rate_mb: 16
+      ingestion_burst_size_mb: 32
+      max_streams_per_user: 10000
+      max_label_names_per_series: 30
+      max_entries_limit_per_query: 50000
+      max_query_series: 500
+      # Cardinality protection
+      max_label_value_length: 2048
+      reject_old_samples: true
+      reject_old_samples_max_age: 24h
+
+    compactor:
+      working_directory: /var/loki/compactor
+      # Enforce retention during compaction
+      retention_enabled: true
+      delete_request_store: s3
+
+    ruler:
+      storage:
+        type: s3
+        s3:
+          bucketNames:
+            ruler: unified-saas-loki-ruler-prod
+
+    querier:
+      max_concurrent: 20
+
+    frontend:
+      max_outstanding_per_tenant: 2048
+      compress_responses: true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Write path (Distributor + Ingester)
+  # ──────────────────────────────────────────────────────────────────────────
+  write:
+    replicas: 3
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    persistence:
+      size: 10Gi
+      storageClass: gp3-encrypted
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: topology.kubernetes.io/zone
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: write
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+      fsGroup: 10001
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Read path (Querier + Query Frontend)
+  # ──────────────────────────────────────────────────────────────────────────
+  read:
+    replicas: 3
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: topology.kubernetes.io/zone
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: read
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+      fsGroup: 10001
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Backend (Compactor + Ruler + Index Gateway)
+  # ──────────────────────────────────────────────────────────────────────────
+  backend:
+    replicas: 3
+    persistence:
+      size: 20Gi
+      storageClass: gp3-encrypted
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+      fsGroup: 10001
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # ServiceAccount for IRSA (S3 access without static IAM keys)
+  # ──────────────────────────────────────────────────────────────────────────
+  serviceAccount:
+    create: true
+    name: loki-sa
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/unified-saas-prod-loki-irsa"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Promtail (DaemonSet log shipper — one pod per node)
+# ─────────────────────────────────────────────────────────────────────────────
+promtail:
+  enabled: true
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  securityContext:
+    runAsUser: 0    # Promtail requires root to read /var/log/pods
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - DAC_READ_SEARCH  # Required to read pod log files owned by other users
+
+  config:
+    logLevel: info
+    serverPort: 3101
+    clients:
+      - url: http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push
+
+    snippets:
+      # Enrich all log lines with Kubernetes metadata
+      extraScrapeConfigs: |
+        - job_name: kubernetes-pods
+          kubernetes_sd_configs:
+            - role: pod
+          pipeline_stages:
+            - cri: {}
+            - multiline:
+                firstline: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}'
+                max_wait_time: 3s
+            - json:
+                expressions:
+                  level: level
+                  msg: msg
+                  tenant_id: tenantId
+                  request_id: requestId
+            - labels:
+                level:
+                tenant_id:
+            - drop:
+                expression: ".*healthz.*"
+                drop_counter_reason: health_check_noise
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_container_name]
+              target_label: container
+            - source_labels: [__meta_kubernetes_pod_label_app]
+              target_label: app
+            - source_labels: [__meta_kubernetes_node_name]
+              target_label: node
+
+        # Collect Istio access logs from proxy sidecars
+        - job_name: istio-proxy-logs
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_container_name]
+              action: keep
+              regex: istio-proxy
+          pipeline_stages:
+            - json:
+                expressions:
+                  authority: authority
+                  method: method
+                  path: path
+                  response_code: response_code
+                  duration: duration
+            - labels:
+                method:
+                path:
+                response_code:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grafana datasource integration (added automatically to Grafana via sidecar)
+# ─────────────────────────────────────────────────────────────────────────────
+grafana:
+  # Do not deploy Grafana here — it is managed by kube-prometheus-stack
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gateway (Nginx reverse proxy for read/write path unification)
+# ─────────────────────────────────────────────────────────────────────────────
+gateway:
+  enabled: true
+  replicas: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    fsGroup: 101
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL

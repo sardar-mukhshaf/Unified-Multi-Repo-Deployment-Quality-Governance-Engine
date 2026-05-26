@@ -1,0 +1,367 @@
+# ------------------------------------------------------------------------------
+# kube-prometheus-stack Helm Values — Production
+# Deploys: Prometheus Operator, Prometheus, Alertmanager, Grafana, node-exporter
+# Namespace: monitoring
+# ------------------------------------------------------------------------------
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global
+# ─────────────────────────────────────────────────────────────────────────────
+nameOverride: ""
+fullnameOverride: ""
+
+commonLabels:
+  app.kubernetes.io/part-of: unified-saas
+  compliance: SAMA-NCA
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus Operator
+# ─────────────────────────────────────────────────────────────────────────────
+prometheusOperator:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus
+# ─────────────────────────────────────────────────────────────────────────────
+prometheus:
+  enabled: true
+  prometheusSpec:
+    # Retain 30 days of metrics in-cluster; long-term offloaded to Thanos/S3
+    retention: 30d
+    retentionSize: "50GB"
+
+    # Scrape interval aligned with Istio telemetry cadence
+    scrapeInterval: "30s"
+    evaluationInterval: "30s"
+
+    # Discover ServiceMonitors and PodMonitors across ALL namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorSelector: {}
+    podMonitorSelector: {}
+    ruleSelector: {}
+
+    # Persistent storage — EBS gp3 encrypted volume
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3-encrypted
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 100Gi
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: 2000m
+        memory: 8Gi
+
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65534
+      fsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
+
+    # Replica set for HA
+    replicas: 2
+
+    # Affinity — spread across AZs
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: topology.kubernetes.io/zone
+              labelSelector:
+                matchLabels:
+                  app: prometheus
+
+    # Additional scrape configs for Istio control plane metrics
+    additionalScrapeConfigs:
+      - job_name: istio-mesh
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - istio-system
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: istiod;http-monitoring
+
+      - job_name: istio-proxy
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            action: keep
+            regex: "istio-proxy"
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:15090
+            target_label: __address__
+
+    # External Labels for multi-cluster federation
+    externalLabels:
+      cluster: unified-saas-prod
+      region: me-central-1
+      environment: prod
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alertmanager
+# ─────────────────────────────────────────────────────────────────────────────
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    replicas: 2
+    retention: 120h
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3-encrypted
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65534
+      fsGroup: 65534
+  config:
+    global:
+      resolve_timeout: 5m
+      smtp_smarthost: "smtp.unified-saas.example.com:587"
+      smtp_from: "alertmanager@unified-saas.example.com"
+      smtp_require_tls: true
+    route:
+      group_by: ["alertname", "cluster", "service"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: "devops-team"
+      routes:
+        - match:
+            severity: critical
+          receiver: "pagerduty-critical"
+          continue: true
+        - match:
+            severity: warning
+          receiver: "devops-team"
+    receivers:
+      - name: "devops-team"
+        email_configs:
+          - to: "devops-alerts@unified-saas.example.com"
+            send_resolved: true
+      - name: "pagerduty-critical"
+        pagerduty_configs:
+          - routing_key: "<PAGERDUTY_INTEGRATION_KEY>"
+            send_resolved: true
+    inhibit_rules:
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal: ["alertname", "cluster", "service"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grafana
+# ─────────────────────────────────────────────────────────────────────────────
+grafana:
+  enabled: true
+  replicas: 2
+
+  adminPassword: "<GRAFANA_ADMIN_PASSWORD_FROM_SECRETS_MANAGER>"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 472
+    fsGroup: 472
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+  persistence:
+    enabled: true
+    storageClassName: gp3-encrypted
+    size: 20Gi
+
+  # Pre-load Istio and Kubernetes dashboards
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: "default"
+          orgId: 1
+          folder: "Unified SaaS"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+
+  dashboards:
+    default:
+      kubernetes-cluster:
+        gnetId: 7249
+        revision: 1
+        datasource: Prometheus
+      istio-mesh:
+        gnetId: 7639
+        revision: 1
+        datasource: Prometheus
+      istio-service:
+        gnetId: 7636
+        revision: 1
+        datasource: Prometheus
+      istio-workload:
+        gnetId: 7630
+        revision: 1
+        datasource: Prometheus
+      node-exporter:
+        gnetId: 1860
+        revision: 31
+        datasource: Prometheus
+
+  grafana.ini:
+    server:
+      root_url: "https://grafana.unified-saas.example.com"
+    auth:
+      disable_login_form: false
+    auth.anonymous:
+      enabled: false
+    security:
+      admin_user: admin
+      cookie_secure: true
+      strict_transport_security: true
+      x_content_type_options: true
+      x_xss_protection: true
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Node Exporter (host-level metrics)
+# ─────────────────────────────────────────────────────────────────────────────
+nodeExporter:
+  enabled: true
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 30Mi
+    limits:
+      cpu: 200m
+      memory: 100Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kube-state-metrics
+# ─────────────────────────────────────────────────────────────────────────────
+kubeStateMetrics:
+  enabled: true
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default PrometheusRules — pre-canned alerting rules
+# ─────────────────────────────────────────────────────────────────────────────
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: true
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserverAvailability: true
+    kubeApiserverBurnrate: true
+    kubeApiserverHistogram: true
+    kubeApiserverSlos: true
+    kubelet: true
+    kubeProxy: true
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeScheduler: true
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true

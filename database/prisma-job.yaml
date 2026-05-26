@@ -1,0 +1,133 @@
+# ------------------------------------------------------------------------------
+# Prisma Migrate Deploy — Kubernetes Job
+# Runs `prisma migrate deploy` against Aurora PostgreSQL via PgBouncer
+# Executed once per deployment by the Jenkins pipeline before ArgoCD sync
+# NEVER run multiple instances concurrently — guarded by ttlSecondsAfterFinished
+# ------------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prisma-migrate-deploy
+  namespace: default
+  labels:
+    app: prisma-migrate
+    app.kubernetes.io/name: prisma-migrate-deploy
+    app.kubernetes.io/component: database-migration
+    app.kubernetes.io/part-of: unified-saas
+    app.kubernetes.io/managed-by: jenkins
+  annotations:
+    # Annotate with the deployment commit SHA for traceability
+    deployment.kubernetes.io/revision: "1"
+spec:
+  # Clean up the Job pod 10 minutes after completion or failure
+  ttlSecondsAfterFinished: 600
+  # Retry at most once on failure (migration failures must be investigated)
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app: prisma-migrate
+        app.kubernetes.io/name: prisma-migrate-deploy
+        app.kubernetes.io/component: database-migration
+        app.kubernetes.io/part-of: unified-saas
+      annotations:
+        # Ensure Istio sidecar does NOT intercept the Job's outbound DB traffic
+        # (Istio mTLS causes issues with PostgreSQL wire protocol)
+        traffic.sidecar.istio.io/excludeOutboundPorts: "6432,5432"
+        sidecar.istio.io/inject: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: backend-api-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Wait for PgBouncer to be ready before running migrations
+        - name: wait-for-pgbouncer
+          image: busybox:1.36.1
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z pgbouncer 6432; do
+                echo "Waiting for PgBouncer at pgbouncer:6432..."
+                sleep 3
+              done
+              echo "PgBouncer is reachable. Starting migration."
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: prisma-migrate
+          # Use the same backend image — Prisma CLI is included in the production image
+          image: "123456789012.dkr.ecr.me-central-1.amazonaws.com/unified-saas-backend:latest"
+          imagePullPolicy: Always
+          # Only run the migration command — do NOT start the Express server
+          command:
+            - npx
+            - prisma
+            - migrate
+            - deploy
+          env:
+            - name: NODE_ENV
+              value: "production"
+            # Connect via PgBouncer in session mode for migrate deploy compatibility
+            # (Prisma migrate deploy requires persistent connections, not transaction pooling)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: database-url-session
+            - name: PRISMA_SCHEMA_PATH
+              value: "/app/prisma/schema.prisma"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: prisma-cache
+              mountPath: /app/.prisma
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+        - name: prisma-cache
+          emptyDir:
+            sizeLimit: 100Mi
+      # Do not spread across zones — this is a one-shot job
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 30

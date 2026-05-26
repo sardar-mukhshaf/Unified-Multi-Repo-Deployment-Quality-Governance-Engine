@@ -1,0 +1,86 @@
+# ------------------------------------------------------------------------------
+# AWS ALB Ingress — Fallback / Direct ALB Entry Point
+# Used when Istio Gateway is bypassed for health checks or when migrating traffic
+# Complements ingress-istio.yaml — ALB terminates TLS, forwards to Istio
+# ------------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: unified-saas-alb-ingress
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/name: unified-saas-alb-ingress
+    app.kubernetes.io/part-of: unified-saas
+    app.kubernetes.io/managed-by: argocd
+  annotations:
+    # AWS Load Balancer Controller annotations
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # TLS — ACM certificate for app and API domains
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:me-central-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+    # Health check targeting the Istio Ingress Gateway healthz endpoint
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz/ready
+    alb.ingress.kubernetes.io/healthcheck-port: "15021"
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+    # WAF — Associate the AWS Managed Rules WAF ACL (SAMA CS-6.1)
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:me-central-1:123456789012:regional/webacl/unified-saas-waf/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+    # Access logging to S3 for compliance audit trail
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=unified-saas-alb-access-logs-prod,
+      access_logs.s3.prefix=alb,
+      idle_timeout.timeout_seconds=60,
+      routing.http.drop_invalid_header_fields.enabled=true,
+      routing.http2.enabled=true
+
+    # Security headers via ALB response headers
+    alb.ingress.kubernetes.io/security-groups: sg-xxxxxxxxxxxxxxxxx
+
+    # Stickiness — not required (stateless via JWT/Istio)
+    alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=false,deregistration_delay.timeout_seconds=30
+
+    # Tags propagated to the ALB resource in AWS Console
+    alb.ingress.kubernetes.io/tags: >-
+      Environment=prod,
+      Project=unified-saas,
+      ManagedBy=terraform,
+      Compliance=SAMA-NCA
+
+spec:
+  ingressClassName: alb
+  rules:
+    # App (frontend) subdomain → Istio Ingress Gateway
+    - host: app.unified-saas.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: istio-ingressgateway
+                port:
+                  number: 80
+
+    # API subdomain → Istio Ingress Gateway (routes to backend via VirtualService)
+    - host: api.unified-saas.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: istio-ingressgateway
+                port:
+                  number: 80
