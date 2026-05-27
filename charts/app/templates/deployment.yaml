@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "universal-app.fullname" . }}
+  labels:
+    app: {{ include "universal-app.name" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "universal-app.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "universal-app.name" . }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          env:
+{{ toYaml .Values.env | indent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

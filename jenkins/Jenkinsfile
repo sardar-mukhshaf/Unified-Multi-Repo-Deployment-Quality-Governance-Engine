@@ -73,16 +73,20 @@ pipeline {
         ansiColor('xterm')
     }
 
+    parameters {
+        string(name: 'APP_NAME', defaultValue: 'unified-saas', description: 'The name of the application')
+        string(name: 'AWS_REGION', defaultValue: 'me-central-1', description: 'AWS Region for ECR and deployment')
+        string(name: 'SONARQUBE_SERVER', defaultValue: 'https://sonarqube.internal.example.com', description: 'SonarQube Server URL')
+        string(name: 'NODE_IMAGE', defaultValue: 'node:20.11.0-alpine', description: 'Node image for build')
+    }
+
     environment {
-        APP_NAME           = 'unified-saas'
-        AWS_REGION         = 'me-central-1'
         AWS_ACCOUNT_ID     = credentials('aws-account-id')
-        ECR_FRONTEND       = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/unified-saas-frontend"
-        ECR_BACKEND        = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/unified-saas-backend"
+        ECR_FRONTEND       = "${AWS_ACCOUNT_ID}.dkr.ecr.${params.AWS_REGION}.amazonaws.com/${params.APP_NAME}-frontend"
+        ECR_BACKEND        = "${AWS_ACCOUNT_ID}.dkr.ecr.${params.AWS_REGION}.amazonaws.com/${params.APP_NAME}-backend"
         GIT_COMMIT_SHORT   = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
         IMAGE_TAG          = "${env.BUILD_NUMBER}-${GIT_COMMIT_SHORT}"
         SONARQUBE_TOKEN    = credentials('sonarqube-token')
-        SONARQUBE_SERVER   = 'https://sonarqube.internal.example.com'
         GITOPS_REPO_URL    = credentials('gitops-repo-url')
         GITOPS_REPO_CRED   = credentials('github-ssh-key')
     }
@@ -174,7 +178,7 @@ pipeline {
                         '''
                         sh '''
                             sonar-scanner \
-                                -Dsonar.projectKey=${APP_NAME} \
+                                -Dsonar.projectKey=${params.APP_NAME} \
                                 -Dsonar.projectName="Unified SaaS Platform" \
                                 -Dsonar.projectVersion=${IMAGE_TAG} \
                                 -Dsonar.sources=frontend/src,backend/src \
@@ -183,7 +187,7 @@ pipeline {
                                 -Dsonar.coverage.exclusions="**/*.test.ts,**/*.test.tsx,**/prisma/**" \
                                 -Dsonar.exclusions="**/node_modules/**,**/dist/**,**/coverage/**" \
                                 -Dsonar.token=${SONARQUBE_TOKEN} \
-                                -Dsonar.host.url=${SONARQUBE_SERVER}
+                                -Dsonar.host.url=${params.SONARQUBE_SERVER}
                         '''
                     }
                 }
@@ -309,8 +313,8 @@ pipeline {
             steps {
                 container('aws-cli') {
                     sh '''
-                        aws ecr get-login-password --region ${AWS_REGION} | \
-                            docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                        aws ecr get-login-password --region ${params.AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${params.AWS_REGION}.amazonaws.com
                     '''
                 }
                 container('docker') {
@@ -360,7 +364,7 @@ pipeline {
                             sh '''
                                 cd gitops-repo
                                 git add apps/frontend/deployment.yaml apps/backend/deployment.yaml
-                                git diff --cached --quiet || git commit -m "ci: deploy ${APP_NAME} ${IMAGE_TAG} [Jenkins Build ${BUILD_NUMBER}]"
+                                git diff --cached --quiet || git commit -m "ci: deploy ${params.APP_NAME} ${IMAGE_TAG} [Jenkins Build ${BUILD_NUMBER}]"
                                 git push origin main
                             '''
                         }

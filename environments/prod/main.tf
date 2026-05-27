@@ -17,7 +17,7 @@ locals {
 # ------------------------------------------------------------------------------
 resource "aws_kms_key" "main" {
   description             = "KMS key for ${var.project_name} ${var.environment} encryption at rest"
-  deletion_window_in_days = 30
+  deletion_window_in_days = var.kms_deletion_window_in_days
   enable_key_rotation     = true
   multi_region            = false
 
@@ -226,7 +226,7 @@ resource "aws_ecr_lifecycle_policy" "frontend" {
         selection = {
           tagStatus   = "any"
           countType   = "imageCountMoreThan"
-          countNumber = 30
+          countNumber = var.ecr_image_retention_count
         }
         action = {
           type = "expire"
@@ -247,7 +247,7 @@ resource "aws_ecr_lifecycle_policy" "backend" {
         selection = {
           tagStatus   = "any"
           countType   = "imageCountMoreThan"
-          countNumber = 30
+          countNumber = var.ecr_image_retention_count
         }
         action = {
           type = "expire"

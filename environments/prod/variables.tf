@@ -129,3 +129,15 @@ variable "enable_guardduty" {
   type        = bool
   default     = true
 }
+
+variable "kms_deletion_window_in_days" {
+  description = "Duration in days after which the key is deleted after destruction of the resource"
+  type        = number
+  default     = 30
+}
+
+variable "ecr_image_retention_count" {
+  description = "Number of immutable ECR images to retain"
+  type        = number
+  default     = 30
+}

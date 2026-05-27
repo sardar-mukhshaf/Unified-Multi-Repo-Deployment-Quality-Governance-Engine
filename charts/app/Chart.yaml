@@ -1,0 +1,6 @@
+apiVersion: v2
+name: universal-app
+description: A Helm chart for deploying microservices in the Unified SaaS ecosystem
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
